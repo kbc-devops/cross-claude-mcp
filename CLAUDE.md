@@ -20,6 +20,12 @@
 - **Railway SaaS** deploys from the private repo via Procfile (`web: node server-saas.mjs`)
 - **Railway open-source** deploys from this repo's `main` branch
 
+## Instance Naming Convention
+
+Cross-Claude 인스턴스 ID는 `{사람}-nova` 형식을 따른다.
+- 예: `mark-nova`, `alice-nova`, `builder-nova`
+- Cowork, Claude Code 등 도구 구분 없이 동일하게 적용
+
 ## Key Rules
 
 - NEVER put SaaS-only code (auth, billing, admin, multi-tenancy) into `server.mjs` or `db.mjs`
