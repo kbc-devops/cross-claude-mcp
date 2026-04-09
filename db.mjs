@@ -23,6 +23,7 @@ const SCHEMA_SQL = `
   CREATE TABLE IF NOT EXISTS instances (
     instance_id TEXT PRIMARY KEY,
     description TEXT,
+    webhook_url TEXT,
     last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     status TEXT DEFAULT 'online'
   );
@@ -84,12 +85,13 @@ class SqliteDB {
     this.db.prepare(`INSERT OR IGNORE INTO channels (name, description) VALUES ('general', 'Default channel for cross-instance communication')`).run();
   }
 
-  registerInstance(instanceId, description) {
+  registerInstance(instanceId, description, webhookUrl = null) {
     this.db.prepare(
-      `INSERT INTO instances (instance_id, description, last_seen, status)
-       VALUES (?, ?, datetime('now'), 'online')
+      `INSERT INTO instances (instance_id, description, webhook_url, last_seen, status)
+       VALUES (?, ?, ?, datetime('now'), 'online')
        ON CONFLICT(instance_id) DO UPDATE SET
          description = excluded.description,
+         webhook_url = COALESCE(excluded.webhook_url, instances.webhook_url),
          last_seen = datetime('now'),
          status = 'online'`
     ).run(instanceId, description);
@@ -277,15 +279,16 @@ class PostgresDB {
     await this.pool.query(SEED_SQL);
   }
 
-  async registerInstance(instanceId, description) {
+  async registerInstance(instanceId, description, webhookUrl = null) {
     await this.pool.query(
-      `INSERT INTO instances (instance_id, description, last_seen, status)
-       VALUES ($1, $2, NOW(), 'online')
+      `INSERT INTO instances (instance_id, description, webhook_url, last_seen, status)
+       VALUES ($1, $2, $3, NOW(), 'online')
        ON CONFLICT(instance_id) DO UPDATE SET
          description = EXCLUDED.description,
+         webhook_url = COALESCE(EXCLUDED.webhook_url, instances.webhook_url),
          last_seen = NOW(),
          status = 'online'`,
-      [instanceId, description]
+      [instanceId, description, webhookUrl]
     );
   }
 
