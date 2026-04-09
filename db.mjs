@@ -33,7 +33,8 @@ const SCHEMA_SQL = `
     content TEXT NOT NULL,
     created_by TEXT NOT NULL,
     description TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    expires_at TIMESTAMP
   );
 
   CREATE TABLE IF NOT EXISTS invite_codes (
@@ -51,6 +52,18 @@ const SCHEMA_SQL = `
     mentioned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     delivered_at TIMESTAMP
   );
+
+  -- Cold storage for archived messages (no FKs — flat copy of messages columns)
+  CREATE TABLE IF NOT EXISTS messages_archive (
+    id INTEGER PRIMARY KEY,
+    channel TEXT NOT NULL,
+    sender TEXT NOT NULL,
+    content TEXT NOT NULL,
+    message_type TEXT,
+    in_reply_to INTEGER,
+    created_at TIMESTAMP,
+    archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
 `;
 
 const INDEX_SQL = `
@@ -59,6 +72,7 @@ const INDEX_SQL = `
   CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
   CREATE INDEX IF NOT EXISTS idx_messages_channel_id_desc ON messages(channel, id DESC);
   CREATE INDEX IF NOT EXISTS idx_unread_mentions_pending ON unread_mentions(instance_id) WHERE delivered_at IS NULL;
+  CREATE INDEX IF NOT EXISTS idx_messages_archive_created ON messages_archive(created_at);
 `;
 
 /**
@@ -217,16 +231,17 @@ class SqliteDB {
     ).all(`%${query}%`, limit);
   }
 
-  shareData(key, content, createdBy, description) {
+  shareData(key, content, createdBy, description, expiresAt = null) {
     this.db.prepare(
-      `INSERT INTO shared_data (key, content, created_by, description, created_at)
-       VALUES (?, ?, ?, ?, datetime('now'))
+      `INSERT INTO shared_data (key, content, created_by, description, created_at, expires_at)
+       VALUES (?, ?, ?, ?, datetime('now'), ?)
        ON CONFLICT(key) DO UPDATE SET
          content = excluded.content,
          created_by = excluded.created_by,
          description = excluded.description,
-         created_at = datetime('now')`
-    ).run(key, content, createdBy, description);
+         created_at = datetime('now'),
+         expires_at = excluded.expires_at`
+    ).run(key, content, createdBy, description, expiresAt);
   }
 
   getSharedData(key) {
@@ -243,12 +258,30 @@ class SqliteDB {
     this.db.prepare(`DELETE FROM shared_data WHERE key = ?`).run(key);
   }
 
-  cleanup(maxAgeDays = 7) {
+  cleanup(maxAgeDays = 30) {
     const interval = `-${maxAgeDays} days`;
-    const msgs = this.db.prepare(`DELETE FROM messages WHERE created_at < datetime('now', ?)`).run(interval);
-    const inst = this.db.prepare(`DELETE FROM instances WHERE last_seen < datetime('now', ?)`).run(interval);
-    const data = this.db.prepare(`DELETE FROM shared_data WHERE created_at < datetime('now', ?)`).run(interval);
-    return { messages: msgs.changes, instances: inst.changes, shared_data: data.changes };
+
+    // 3-B: archive messages (move, don't delete) — keeps history but removes from hot table
+    const archived = this.db.prepare(
+      `INSERT OR IGNORE INTO messages_archive (id, channel, sender, content, message_type, in_reply_to, created_at)
+       SELECT id, channel, sender, content, message_type, in_reply_to, created_at
+       FROM messages WHERE created_at < datetime('now', ?)`
+    ).run(interval).changes;
+    // Need to clear FK refs (in_reply_to, unread_mentions) before delete
+    this.db.prepare(`UPDATE messages SET in_reply_to = NULL WHERE in_reply_to IN (SELECT id FROM messages WHERE created_at < datetime('now', ?))`).run(interval);
+    const msgs = this.db.prepare(`DELETE FROM messages WHERE created_at < datetime('now', ?)`).run(interval).changes;
+
+    // 3-A: stale instance auto-purge (preserve discord-bridge)
+    const inst = this.db.prepare(
+      `DELETE FROM instances WHERE last_seen < datetime('now', ?) AND instance_id != 'discord-bridge'`
+    ).run(interval).changes;
+
+    // 3-C: TTL-based shared_data deletion (only deletes items with expires_at set & expired)
+    const data = this.db.prepare(
+      `DELETE FROM shared_data WHERE expires_at IS NOT NULL AND expires_at < datetime('now')`
+    ).run().changes;
+
+    return { messages: msgs, archived, instances: inst, shared_data: data };
   }
 
   purgeAll() {
@@ -462,16 +495,17 @@ class PostgresDB {
     return result.rows;
   }
 
-  async shareData(key, content, createdBy, description) {
+  async shareData(key, content, createdBy, description, expiresAt = null) {
     await this.pool.query(
-      `INSERT INTO shared_data (key, content, created_by, description)
-       VALUES ($1, $2, $3, $4)
+      `INSERT INTO shared_data (key, content, created_by, description, expires_at)
+       VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT(key) DO UPDATE SET
          content = EXCLUDED.content,
          created_by = EXCLUDED.created_by,
          description = EXCLUDED.description,
-         created_at = NOW()`,
-      [key, content, createdBy, description]
+         created_at = NOW(),
+         expires_at = EXCLUDED.expires_at`,
+      [key, content, createdBy, description, expiresAt]
     );
   }
 
@@ -491,12 +525,38 @@ class PostgresDB {
     await this.pool.query(`DELETE FROM shared_data WHERE key = $1`, [key]);
   }
 
-  async cleanup(maxAgeDays = 7) {
-    const interval = `${maxAgeDays} days`;
-    const msgs = await this.pool.query(`DELETE FROM messages WHERE created_at < NOW() - INTERVAL '1 day' * $1`, [maxAgeDays]);
-    const inst = await this.pool.query(`DELETE FROM instances WHERE last_seen < NOW() - INTERVAL '1 day' * $1`, [maxAgeDays]);
-    const data = await this.pool.query(`DELETE FROM shared_data WHERE created_at < NOW() - INTERVAL '1 day' * $1`, [maxAgeDays]);
-    return { messages: msgs.rowCount, instances: inst.rowCount, shared_data: data.rowCount };
+  async cleanup(maxAgeDays = 30) {
+    // 3-B: archive messages (move, don't delete)
+    const archiveResult = await this.pool.query(
+      `INSERT INTO messages_archive (id, channel, sender, content, message_type, in_reply_to, created_at)
+       SELECT id, channel, sender, content, message_type, in_reply_to, created_at
+       FROM messages WHERE created_at < NOW() - INTERVAL '1 day' * $1
+       ON CONFLICT (id) DO NOTHING`,
+      [maxAgeDays]
+    );
+    const archived = archiveResult.rowCount;
+    // Clear in_reply_to FK refs before delete
+    await this.pool.query(
+      `UPDATE messages SET in_reply_to = NULL WHERE in_reply_to IN (SELECT id FROM messages WHERE created_at < NOW() - INTERVAL '1 day' * $1)`,
+      [maxAgeDays]
+    );
+    const msgs = await this.pool.query(
+      `DELETE FROM messages WHERE created_at < NOW() - INTERVAL '1 day' * $1`,
+      [maxAgeDays]
+    );
+
+    // 3-A: stale instance auto-purge (preserve discord-bridge)
+    const inst = await this.pool.query(
+      `DELETE FROM instances WHERE last_seen < NOW() - INTERVAL '1 day' * $1 AND instance_id != 'discord-bridge'`,
+      [maxAgeDays]
+    );
+
+    // 3-C: TTL-based shared_data deletion
+    const data = await this.pool.query(
+      `DELETE FROM shared_data WHERE expires_at IS NOT NULL AND expires_at < NOW()`
+    );
+
+    return { messages: msgs.rowCount, archived, instances: inst.rowCount, shared_data: data.rowCount };
   }
 
   async purgeAll() {

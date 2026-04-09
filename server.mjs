@@ -146,7 +146,7 @@ li{margin:4px 0}</style></head>
 
   app.use((req, res, next) => {
     // Skip auth for public endpoints
-    if (req.path === "/health" || req.path === "/readme" || req.path.startsWith("/openapi.json")) return next();
+    if (req.path === "/health" || req.path === "/readme" || req.path.startsWith("/openapi.json") || req.path === "/webhook/deploy") return next();
     // Skip auth for OAuth endpoints (handled by mcpAuthRouter)
     if (req.path.startsWith("/.well-known/") || req.path === "/authorize" || req.path === "/authorize/submit" || req.path === "/token" || req.path === "/register" || req.path === "/revoke") return next();
 
@@ -282,7 +282,7 @@ li{margin:4px 0}</style></head>
 
   // --- Auto-cleanup: delete data older than 7 days ---
 
-  const CLEANUP_DAYS = parseInt(process.env.CLEANUP_DAYS) || 7;
+  const CLEANUP_DAYS = parseInt(process.env.CLEANUP_DAYS) || 30;  // 3-A/3-B/3-C: archive at 30d (was 7d delete)
   const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 
   async function runCleanup() {
@@ -290,7 +290,7 @@ li{margin:4px 0}</style></head>
       const result = await db.cleanup(CLEANUP_DAYS);
       const total = result.messages + result.instances + result.shared_data;
       if (total > 0) {
-        console.log(`[CLEANUP] Removed ${result.messages} messages, ${result.instances} instances, ${result.shared_data} shared data (older than ${CLEANUP_DAYS} days)`);
+        console.log(`[CLEANUP] archived ${result.archived || 0} msgs, removed ${result.messages || 0} msgs (post-archive), ${result.instances || 0} stale instances, ${result.shared_data || 0} expired shared_data (threshold ${CLEANUP_DAYS}d)`);
       }
     } catch (err) {
       console.error(`[CLEANUP] Error: ${err.message}`);
@@ -299,6 +299,50 @@ li{margin:4px 0}</style></head>
 
   await runCleanup();
   setInterval(runCleanup, CLEANUP_INTERVAL_MS);
+
+
+  // --- GitHub Deploy Webhook ---
+
+  app.post("/webhook/deploy", express.raw({ type: "application/json" }), async (req, res) => {
+    const { createHmac } = await import("crypto");
+    const { exec } = await import("child_process");
+
+    const secret = process.env.DEPLOY_WEBHOOK_SECRET;
+    if (!secret) return res.status(500).json({ error: "DEPLOY_WEBHOOK_SECRET not configured" });
+
+    const sig = req.headers["x-hub-signature-256"] || "";
+    const expected = "sha256=" + createHmac("sha256", secret).update(req.body).digest("hex");
+    if (sig !== expected) {
+      console.log("[DEPLOY] invalid signature");
+      return res.status(401).json({ error: "Invalid signature" });
+    }
+
+    const payload = JSON.parse(req.body.toString());
+    const ref = payload.ref || "";
+    const repo = payload.repository?.full_name || "";
+
+    console.log(`[DEPLOY] webhook: ${repo} ${ref}`);
+
+    if (ref !== "refs/heads/main") {
+      return res.json({ ok: true, skipped: true, reason: "not main branch" });
+    }
+
+    const DEPLOY_TARGETS = {
+      "kbc-devops/cross-claude-discord-bridge":
+        "cd /home/mark/repos/cross-claude-discord-bridge && git pull && pm2 restart cross-claude-bridge",
+    };
+
+    const cmd = DEPLOY_TARGETS[repo];
+    if (!cmd) return res.status(400).json({ error: `Unknown repo: ${repo}` });
+
+    res.json({ ok: true, message: "Deploy started" });
+
+    exec(cmd, (err, stdout, stderr) => {
+      if (err) console.error(`[DEPLOY] failed (${repo}): ${err.message}`);
+      else console.log(`[DEPLOY] success (${repo}): ${stdout.trim()}`);
+      if (stderr) console.log(`[DEPLOY] stderr: ${stderr.trim()}`);
+    });
+  });
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`cross-claude-mcp v2.0.0 listening on port ${PORT}`);

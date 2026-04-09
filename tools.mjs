@@ -398,17 +398,20 @@ export function registerTools(server, db, planChecker = null) {
       content: z.string().describe("The data content to share"),
       sender: z.string().describe("Your instance_id"),
       description: z.string().optional().describe("Brief description of what this data is"),
+      ttl_days: z.number().optional().describe("Auto-delete after N days (TTL). Omit for no expiration."),
     },
-    async ({ key, content, sender, description }) => {
+    async ({ key, content, sender, description, ttl_days }) => {
       if (planChecker) {
         const check = await planChecker("share_data");
         if (!check.allowed) return { content: [{ type: "text", text: check.message }] };
       }
       touchHeartbeat();
-      await db.shareData(key, content, sender, description || null);
+      const expiresAt = ttl_days ? new Date(Date.now() + ttl_days * 86400000).toISOString() : null;
+      await db.shareData(key, content, sender, description || null, expiresAt);
       const sizeKb = (Buffer.byteLength(content) / 1024).toFixed(1);
+      const ttlNote = expiresAt ? ` (expires ${expiresAt.split('T')[0]})` : "";
       return {
-        content: [{ type: "text", text: `Shared data stored as "${key}" (${sizeKb} KB). Other instances can retrieve it with get_shared_data.` }],
+        content: [{ type: "text", text: `Shared data stored as "${key}" (${sizeKb} KB)${ttlNote}. Other instances can retrieve it with get_shared_data.` }],
       };
     }
   );

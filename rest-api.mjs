@@ -156,13 +156,14 @@ export function createRestRouter(db) {
 
   router.post("/data", async (req, res, next) => {
     try {
-      const { key, content, sender, description } = req.body;
+      const { key, content, sender, description, ttl_days } = req.body;
       if (!key) return res.status(400).json({ error: "key is required" });
       if (!content) return res.status(400).json({ error: "content is required" });
       if (!sender) return res.status(400).json({ error: "sender is required" });
-      await db.shareData(key, content, sender, description || null);
+      const expiresAt = ttl_days ? new Date(Date.now() + ttl_days * 86400000).toISOString() : null;
+      await db.shareData(key, content, sender, description || null, expiresAt);
       const size_bytes = Buffer.byteLength(content);
-      res.json({ ok: true, key, size_bytes });
+      res.json({ ok: true, key, size_bytes, expires_at: expiresAt });
     } catch (e) { next(e); }
   });
 
