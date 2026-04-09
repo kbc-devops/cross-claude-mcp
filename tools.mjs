@@ -45,8 +45,9 @@ export function registerTools(server, db, planChecker = null) {
     {
       instance_id: z.string().describe("Unique name for this instance (e.g., 'alice', 'builder', 'reviewer')"),
       description: z.string().optional().describe("What this instance is working on"),
+      webhook_url: z.string().optional().describe("Discord webhook URL for this instance (enables custom avatar in #cross-ai-cowork channel)"),
     },
-    async ({ instance_id, description }) => {
+    async ({ instance_id, description, webhook_url }) => {
       if (planChecker) {
         const check = await planChecker("register");
         if (!check.allowed) return { content: [{ type: "text", text: check.message }] };
@@ -55,7 +56,7 @@ export function registerTools(server, db, planChecker = null) {
         await db.markOffline(currentInstanceId);
       }
       currentInstanceId = instance_id;
-      await db.registerInstance(instance_id, description || null);
+      await db.registerInstance(instance_id, description || null, webhook_url || null);
 
       // Provide context: active channels and online instances
       const channels = await db.listChannelsWithActivity();
