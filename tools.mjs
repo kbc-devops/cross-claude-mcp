@@ -264,6 +264,103 @@ export function registerTools(server, db, planChecker = null) {
   );
 
   server.tool(
+    "register_and_listen",
+    "ATOMIC register + persistent polling. Recommended way to start a listener instance — combines register and wait_for_reply into one call so the model cannot drift between them. On first call, registers your instance, immediately delivers any queued unread mentions, then blocks polling the channel until a message arrives or max_wait_minutes elapses. After processing returned messages, you MUST call this tool again with the SAME params to continue listening. Do NOT switch to other tools while in listener mode.",
+    {
+      instance_id: z.string().describe("Your unique instance_id (e.g., mark-nova-hub)"),
+      description: z.string().optional().describe("What this instance is doing"),
+      webhook_url: z.string().optional().describe("Discord webhook URL for custom avatar (optional)"),
+      channel: z.string().default("cross-ai-cowork").describe("Channel to listen on"),
+      after_id: z.number().optional().describe("Skip messages with id <= this value (optional, defaults to current latest)"),
+      max_wait_minutes: z.number().default(30).describe("Max minutes to block before returning timeout"),
+      poll_interval_seconds: z.number().default(5).describe("Seconds between DB polls"),
+    },
+    async ({ instance_id, description, webhook_url, channel, after_id, max_wait_minutes, poll_interval_seconds }) => {
+      const normalized = normalizeChannelName(channel);
+
+      // 1) Register / refresh
+      if (currentInstanceId && currentInstanceId !== instance_id) {
+        await db.markOffline(currentInstanceId);
+      }
+      currentInstanceId = instance_id;
+      await db.registerInstance(instance_id, description || null, webhook_url || null);
+      await db.markStaleOffline(STALE_THRESHOLD_SECONDS);
+
+      // 2) Ensure channel exists
+      try { await db.createChannel(normalized, null); } catch {}
+
+      // 3) Deliver any pending unread mentions
+      let unreadSummary = "";
+      let unreadIds = [];
+      try {
+        const unread = await db.getUnreadMentions(instance_id);
+        if (unread.length > 0) {
+          unreadSummary = `\n\n📣 ${unread.length} unread mention(s) delivered on register:\n` +
+            unread.map(u => `  #${u.message_id} [${u.message_type}] ${u.sender}: ${String(u.content).slice(0, 200)}`).join("\n");
+          unreadIds = unread.map(u => u.message_id);
+          await db.markMentionsDelivered(instance_id);
+        }
+      } catch (e) { /* legacy DB */ }
+
+      // 4) Establish baseline after_id (default = latest message id)
+      let baselineId = after_id;
+      if (baselineId === undefined) {
+        try {
+          const recent = await db.getMessages(normalized, 1);
+          baselineId = (recent.length > 0) ? recent[0].id : 0;
+        } catch { baselineId = 0; }
+      }
+      // If unread mentions delivered, advance baseline past them too
+      if (unreadIds.length > 0) {
+        baselineId = Math.max(baselineId, ...unreadIds);
+      }
+
+      // 5) If unread mentions were delivered, return immediately so caller can process them
+      if (unreadSummary) {
+        return {
+          content: [{ type: "text", text:
+            `Registered as "${instance_id}" + listening on #${normalized}.${unreadSummary}\n\n---\nLast ID: ${baselineId}\n\n⚠️ AFTER PROCESSING THESE MESSAGES: immediately call register_and_listen again with the SAME params (after_id can be omitted to auto-advance, or pass after_id=${baselineId}). Do NOT call any other tool unless the user explicitly tells you to stop listening.`
+          }],
+        };
+      }
+
+      // 6) Block polling until message arrives or hard deadline
+      const start = Date.now();
+      const hardDeadline = start + max_wait_minutes * 60 * 1000;
+
+      while (Date.now() < hardDeadline) {
+        try { await db.heartbeat(instance_id); } catch {}
+        const msgs = await db.getUnread(normalized, baselineId, instance_id);
+        if (msgs.length > 0) {
+          const hasDone = msgs.some(m => m.message_type === "done");
+          const formatted = msgs.map(m =>
+            `#${m.id} [${m.message_type}] ${m.sender} (${m.created_at})${m.in_reply_to ? ` (reply to #${m.in_reply_to})` : ""}:\n${m.content}`
+          ).join("\n\n---\n\n");
+          const newLastId = msgs[msgs.length - 1].id;
+
+          // Mark any in-band mentions as delivered too
+          try { await db.markMentionsDelivered(instance_id); } catch {}
+
+          return {
+            content: [{ type: "text", text:
+              `Listening as "${instance_id}" on #${normalized}.\n\n${msgs.length} new message(s):\n\n${formatted}\n\n---\nLast ID: ${newLastId}${hasDone ? "\n\n✅ Another instance signaled DONE." : ""}\n\n⚠️ AFTER PROCESSING: immediately call register_and_listen again with the SAME params to continue listening. The user did NOT tell you to stop. Do NOT switch to other tools unless absolutely required by the message content.`
+            }],
+          };
+        }
+        await new Promise(r => setTimeout(r, poll_interval_seconds * 1000));
+      }
+
+      // 7) Timeout
+      const elapsed = Math.round((Date.now() - start) / 60000);
+      return {
+        content: [{ type: "text", text:
+          `Listened on #${normalized} as "${instance_id}" for ${elapsed} minute(s) — no messages.\n\n⚠️ Call register_and_listen again immediately with the SAME params to keep listening. Do NOT disconnect unless the user explicitly says so.`
+        }],
+      };
+    }
+  );
+
+  server.tool(
     "get_replies",
     "Get all replies to a specific message.",
     { message_id: z.number().describe("The message ID to get replies for") },
