@@ -43,12 +43,22 @@ const SCHEMA_SQL = `
     used_at TIMESTAMP,
     used_by TEXT
   );
+
+  CREATE TABLE IF NOT EXISTS unread_mentions (
+    id SERIAL PRIMARY KEY,
+    instance_id TEXT NOT NULL REFERENCES instances(instance_id) ON DELETE CASCADE,
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    mentioned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    delivered_at TIMESTAMP
+  );
 `;
 
 const INDEX_SQL = `
   CREATE INDEX IF NOT EXISTS idx_messages_channel ON messages(channel);
   CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender);
   CREATE INDEX IF NOT EXISTS idx_messages_created ON messages(created_at);
+  CREATE INDEX IF NOT EXISTS idx_messages_channel_id_desc ON messages(channel, id DESC);
+  CREATE INDEX IF NOT EXISTS idx_unread_mentions_pending ON unread_mentions(instance_id) WHERE delivered_at IS NULL;
 `;
 
 /**
@@ -94,7 +104,7 @@ class SqliteDB {
          webhook_url = COALESCE(excluded.webhook_url, instances.webhook_url),
          last_seen = datetime('now'),
          status = 'online'`
-    ).run(instanceId, description);
+    ).run(instanceId, description, webhookUrl);
   }
 
   heartbeat(instanceId) {
