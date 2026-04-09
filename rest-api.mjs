@@ -10,7 +10,7 @@
 
 import { Router } from "express";
 import { STALE_THRESHOLD_SECONDS } from "./tools.mjs";
-import { normalizeChannelName } from "./db.mjs";
+import { normalizeChannelName, detectAndQueueMentions } from "./db.mjs";
 
 /**
  * @param {object} db - Database instance (SqliteDB or PostgresDB)
@@ -33,7 +33,12 @@ export function createRestRouter(db) {
       const { instance_id, description, webhook_url } = req.body;
       if (!instance_id) return res.status(400).json({ error: "instance_id is required" });
       await db.registerInstance(instance_id, description || null, webhook_url || null);
-      res.json({ ok: true, instance_id });
+      let unread_mentions = [];
+      try {
+        unread_mentions = await db.getUnreadMentions(instance_id);
+        if (unread_mentions.length > 0) await db.markMentionsDelivered(instance_id);
+      } catch (e) { /* legacy DB */ }
+      res.json({ ok: true, instance_id, unread_mentions });
     } catch (e) { next(e); }
   });
 
@@ -90,7 +95,11 @@ export function createRestRouter(db) {
       // Auto-create channel if it doesn't exist
       await db.createChannel(normalized, null);
       const id = await db.sendMessage(normalized, sender, content, message_type, in_reply_to || null);
-      res.json({ ok: true, id: Number(id), channel: normalized, message_type });
+      let mentioned = [];
+      try {
+        mentioned = await detectAndQueueMentions(db, id, content, sender);
+      } catch (e) { /* unread_mentions may not exist on legacy DB */ }
+      res.json({ ok: true, id: Number(id), channel: normalized, message_type, mentioned });
     } catch (e) { next(e); }
   });
 
@@ -112,7 +121,14 @@ export function createRestRouter(db) {
       }
 
       const last_id = messages.length > 0 ? Number(messages[messages.length - 1].id) : null;
-      res.json({ messages, last_id });
+      let unread_mentions = [];
+      if (instance_id) {
+        try {
+          unread_mentions = await db.getUnreadMentions(instance_id);
+          if (unread_mentions.length > 0) await db.markMentionsDelivered(instance_id);
+        } catch (e) { /* legacy DB */ }
+      }
+      res.json({ messages, last_id, unread_mentions });
     } catch (e) { next(e); }
   });
 

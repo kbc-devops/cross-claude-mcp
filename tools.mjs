@@ -4,7 +4,7 @@
  */
 
 import { z } from "zod";
-import { normalizeChannelName } from "./db.mjs";
+import { normalizeChannelName, detectAndQueueMentions } from "./db.mjs";
 
 export const STALE_THRESHOLD_SECONDS = 120;
 
@@ -76,8 +76,19 @@ export function registerTools(server, db, planChecker = null) {
           ).join("\n")
         : "\n\nNo other instances online.";
 
+      // Deliver any unread mentions queued while this instance was offline
+      let unreadMentionSummary = "";
+      try {
+        const unread = await db.getUnreadMentions(instance_id);
+        if (unread.length > 0) {
+          unreadMentionSummary = `\n\n📣 ${unread.length} unread mention(s) while you were away:\n` +
+            unread.map(u => `  #${u.message_id} [#${u.channel}] [${u.message_type}] ${u.sender}: ${String(u.content).slice(0, 120)}`).join("\n");
+          await db.markMentionsDelivered(instance_id);
+        }
+      } catch (e) { /* unread_mentions table may not exist on legacy DB */ }
+
       return {
-        content: [{ type: "text", text: `Registered as "${instance_id}".${channelSummary}${instanceSummary}\n\nNEXT STEPS: Call 'list_channels' to find the right channel for your work, then 'check_messages' on that channel. Do NOT default to 'general' if a more specific channel exists.` }],
+        content: [{ type: "text", text: `Registered as "${instance_id}".${channelSummary}${instanceSummary}${unreadMentionSummary}\n\nNEXT STEPS: Call 'list_channels' to find the right channel for your work, then 'check_messages' on that channel. Do NOT default to 'general' if a more specific channel exists.` }],
       };
     }
   );
@@ -123,12 +134,22 @@ export function registerTools(server, db, planChecker = null) {
       await db.createChannel(normalized, null);
       touchHeartbeat();
       const id = await db.sendMessage(normalized, sender, content, message_type, in_reply_to || null);
+
+      // Detect and queue mentions of registered instances
+      let mentionedNote = "";
+      try {
+        const mentioned = await detectAndQueueMentions(db, id, content, sender);
+        if (mentioned.length > 0) {
+          mentionedNote = `\n\n📣 Mentioned: ${mentioned.join(", ")}`;
+        }
+      } catch (e) { /* unread_mentions may not exist on legacy DB */ }
+
       const nameNote = normalized !== channel ? ` (normalized from "${channel}")` : "";
       const doneHint = message_type === "response"
         ? `\n\n💡 If this is your final reply, send a follow-up "done" message so the other instance stops polling.`
         : "";
       return {
-        content: [{ type: "text", text: `Message #${id} sent to #${normalized}${nameNote} as "${sender}" [${message_type}]${warning}${doneHint}` }],
+        content: [{ type: "text", text: `Message #${id} sent to #${normalized}${nameNote} as "${sender}" [${message_type}]${warning}${mentionedNote}${doneHint}` }],
       };
     }
   );
@@ -164,8 +185,22 @@ export function registerTools(server, db, planChecker = null) {
       ).join("\n\n---\n\n");
 
       const lastId = messages[messages.length - 1].id;
+
+      // Deliver unread mentions for this instance (if instance_id provided)
+      let unreadMentionSummary = "";
+      if (instance_id) {
+        try {
+          const unread = await db.getUnreadMentions(instance_id);
+          if (unread.length > 0) {
+            unreadMentionSummary = `\n\n📣 ${unread.length} unread mention(s):\n` +
+              unread.map(u => `  #${u.message_id} [#${u.channel}] [${u.message_type}] ${u.sender}: ${String(u.content).slice(0, 120)}`).join("\n");
+            await db.markMentionsDelivered(instance_id);
+          }
+        } catch (e) { /* unread_mentions may not exist on legacy DB */ }
+      }
+
       return {
-        content: [{ type: "text", text: `${messages.length} message(s) in #${normalized}:\n\n${formatted}\n\n---\nLast message ID: ${lastId} (use as after_id to poll for new messages)` }],
+        content: [{ type: "text", text: `${messages.length} message(s) in #${normalized}:\n\n${formatted}\n\n---\nLast message ID: ${lastId} (use as after_id to poll for new messages)${unreadMentionSummary}` }],
       };
     }
   );

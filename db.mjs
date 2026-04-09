@@ -78,7 +78,7 @@ class SqliteDB {
     this.db = new Database(this.dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
-    const sqliteSchema = SCHEMA_SQL.replace("SERIAL PRIMARY KEY", "INTEGER PRIMARY KEY AUTOINCREMENT")
+    const sqliteSchema = SCHEMA_SQL.replace(/SERIAL PRIMARY KEY/g, "INTEGER PRIMARY KEY AUTOINCREMENT")
       .replace(/TIMESTAMP DEFAULT CURRENT_TIMESTAMP/g, "TEXT DEFAULT (datetime('now'))");
     this.db.exec(sqliteSchema);
     this.db.exec(INDEX_SQL);
@@ -247,6 +247,33 @@ class SqliteDB {
     this.db.prepare(`DELETE FROM shared_data`).run();
   }
 
+  // --- Unread mentions ---
+  queueMention(instanceId, messageId) {
+    this.db.prepare(
+      `INSERT INTO unread_mentions (instance_id, message_id) VALUES (?, ?)`
+    ).run(instanceId, messageId);
+  }
+
+  getUnreadMentions(instanceId) {
+    return this.db.prepare(
+      `SELECT um.id AS mention_id, um.message_id, um.mentioned_at,
+              m.channel, m.sender, m.content, m.message_type
+       FROM unread_mentions um
+       JOIN messages m ON m.id = um.message_id
+       WHERE um.instance_id = ? AND um.delivered_at IS NULL
+       ORDER BY um.mentioned_at ASC`
+    ).all(instanceId);
+  }
+
+  markMentionsDelivered(instanceId) {
+    const result = this.db.prepare(
+      `UPDATE unread_mentions SET delivered_at = datetime('now')
+       WHERE instance_id = ? AND delivered_at IS NULL`
+    ).run(instanceId);
+    return result.changes;
+  }
+
+  // --- Invite codes ---
   createInviteCode(code, label) {
     this.db.prepare(`INSERT INTO invite_codes (code, label) VALUES (?, ?)`).run(code, label);
   }
@@ -468,6 +495,37 @@ class PostgresDB {
     await this.pool.query(`DELETE FROM shared_data`);
   }
 
+  // --- Unread mentions ---
+  async queueMention(instanceId, messageId) {
+    await this.pool.query(
+      `INSERT INTO unread_mentions (instance_id, message_id) VALUES ($1, $2)`,
+      [instanceId, messageId]
+    );
+  }
+
+  async getUnreadMentions(instanceId) {
+    const result = await this.pool.query(
+      `SELECT um.id AS mention_id, um.message_id, um.mentioned_at,
+              m.channel, m.sender, m.content, m.message_type
+       FROM unread_mentions um
+       JOIN messages m ON m.id = um.message_id
+       WHERE um.instance_id = $1 AND um.delivered_at IS NULL
+       ORDER BY um.mentioned_at ASC`,
+      [instanceId]
+    );
+    return result.rows;
+  }
+
+  async markMentionsDelivered(instanceId) {
+    const result = await this.pool.query(
+      `UPDATE unread_mentions SET delivered_at = NOW()
+       WHERE instance_id = $1 AND delivered_at IS NULL`,
+      [instanceId]
+    );
+    return result.rowCount;
+  }
+
+  // --- Invite codes ---
   async createInviteCode(code, label) {
     await this.pool.query(`INSERT INTO invite_codes (code, label) VALUES ($1, $2)`, [code, label]);
   }
@@ -485,6 +543,33 @@ class PostgresDB {
     const result = await this.pool.query(`SELECT * FROM invite_codes ORDER BY created_at DESC`);
     return result.rows;
   }
+}
+
+/**
+ * Detect mentions of registered instance_ids in message content and queue them.
+ * Word-boundary regex avoids false positives ("mark-nova-hub" doesn't match "mark-nova-hub-test").
+ * Returns array of mentioned instance_ids.
+ */
+export async function detectAndQueueMentions(db, messageId, content, senderInstanceId) {
+  if (!content) return [];
+  const instances = await db.listInstances();
+  const mentioned = [];
+  for (const inst of instances) {
+    if (inst.instance_id === senderInstanceId) continue;
+    if (inst.instance_id === 'discord-bridge') continue; // never mention the bridge itself
+    const escaped = inst.instance_id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(`(?<![\\w-])${escaped}(?![\\w-])`);
+    if (re.test(content)) {
+      try {
+        await db.queueMention(inst.instance_id, messageId);
+        mentioned.push(inst.instance_id);
+      } catch (e) {
+        // FK violation or DB issue — log but don't crash send
+        console.warn(`[mention] queue failed ${inst.instance_id} #${messageId}: ${e.message}`);
+      }
+    }
+  }
+  return mentioned;
 }
 
 // --- Factory ---
