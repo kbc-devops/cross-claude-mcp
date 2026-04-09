@@ -70,6 +70,52 @@ async function startHTTP(db) {
   const { requireBearerAuth } = await import("@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js");
   const { getOAuthProtectedResourceMetadataUrl } = await import("@modelcontextprotocol/sdk/server/auth/router.js");
 
+  // --- GitHub Deploy Webhook ---
+  // MUST be registered BEFORE mcpAuthRouter so express.raw() captures the
+  // unparsed body for HMAC verification. mcpAuthRouter mounts express.json()
+  // internally which would otherwise consume the body first.
+
+  app.post("/webhook/deploy", express.raw({ type: "application/json" }), async (req, res) => {
+    const { createHmac } = await import("crypto");
+    const { exec } = await import("child_process");
+
+    const secret = process.env.DEPLOY_WEBHOOK_SECRET;
+    if (!secret) return res.status(500).json({ error: "DEPLOY_WEBHOOK_SECRET not configured" });
+
+    const sig = req.headers["x-hub-signature-256"] || "";
+    const expected = "sha256=" + createHmac("sha256", secret).update(req.body).digest("hex");
+    if (sig !== expected) {
+      console.log("[DEPLOY] invalid signature");
+      return res.status(401).json({ error: "Invalid signature" });
+    }
+
+    const payload = JSON.parse(req.body.toString());
+    const ref = payload.ref || "";
+    const repo = payload.repository?.full_name || "";
+
+    console.log(`[DEPLOY] webhook: ${repo} ${ref}`);
+
+    if (ref !== "refs/heads/main") {
+      return res.json({ ok: true, skipped: true, reason: "not main branch" });
+    }
+
+    const DEPLOY_TARGETS = {
+      "kbc-devops/cross-claude-discord-bridge":
+        "cd /home/mark/repos/cross-claude-discord-bridge && git pull && pm2 restart cross-claude-bridge",
+    };
+
+    const cmd = DEPLOY_TARGETS[repo];
+    if (!cmd) return res.status(400).json({ error: `Unknown repo: ${repo}` });
+
+    res.json({ ok: true, message: "Deploy started" });
+
+    exec(cmd, (err, stdout, stderr) => {
+      if (err) console.error(`[DEPLOY] failed (${repo}): ${err.message}`);
+      else console.log(`[DEPLOY] success (${repo}): ${stdout.trim()}`);
+      if (stderr) console.log(`[DEPLOY] stderr: ${stderr.trim()}`);
+    });
+  });
+
   app.use(mcpAuthRouter({
     provider: oauthProvider,
     issuerUrl: new URL(SERVER_URL),
@@ -300,49 +346,6 @@ li{margin:4px 0}</style></head>
   await runCleanup();
   setInterval(runCleanup, CLEANUP_INTERVAL_MS);
 
-
-  // --- GitHub Deploy Webhook ---
-
-  app.post("/webhook/deploy", express.raw({ type: "application/json" }), async (req, res) => {
-    const { createHmac } = await import("crypto");
-    const { exec } = await import("child_process");
-
-    const secret = process.env.DEPLOY_WEBHOOK_SECRET;
-    if (!secret) return res.status(500).json({ error: "DEPLOY_WEBHOOK_SECRET not configured" });
-
-    const sig = req.headers["x-hub-signature-256"] || "";
-    const expected = "sha256=" + createHmac("sha256", secret).update(req.body).digest("hex");
-    if (sig !== expected) {
-      console.log("[DEPLOY] invalid signature");
-      return res.status(401).json({ error: "Invalid signature" });
-    }
-
-    const payload = JSON.parse(req.body.toString());
-    const ref = payload.ref || "";
-    const repo = payload.repository?.full_name || "";
-
-    console.log(`[DEPLOY] webhook: ${repo} ${ref}`);
-
-    if (ref !== "refs/heads/main") {
-      return res.json({ ok: true, skipped: true, reason: "not main branch" });
-    }
-
-    const DEPLOY_TARGETS = {
-      "kbc-devops/cross-claude-discord-bridge":
-        "cd /home/mark/repos/cross-claude-discord-bridge && git pull && pm2 restart cross-claude-bridge",
-    };
-
-    const cmd = DEPLOY_TARGETS[repo];
-    if (!cmd) return res.status(400).json({ error: `Unknown repo: ${repo}` });
-
-    res.json({ ok: true, message: "Deploy started" });
-
-    exec(cmd, (err, stdout, stderr) => {
-      if (err) console.error(`[DEPLOY] failed (${repo}): ${err.message}`);
-      else console.log(`[DEPLOY] success (${repo}): ${stdout.trim()}`);
-      if (stderr) console.log(`[DEPLOY] stderr: ${stderr.trim()}`);
-    });
-  });
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`cross-claude-mcp v2.0.0 listening on port ${PORT}`);
